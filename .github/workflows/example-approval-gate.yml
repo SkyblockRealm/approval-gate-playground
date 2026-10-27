@@ -165,6 +165,11 @@ jobs:
   # The gate. One job names the environment, so one approval per run — a second
   # gated job in the same run may re-ask depending on the rules configured, and
   # there is no reason to spend a second approval on the same decision.
+  #
+  # The name interpolates the target so a waiting run is readable in the inbox.
+  # On a *skipped* job (dry run) GitHub does not evaluate it and the title renders
+  # literally as `deploy (${{ inputs.target }})`; that is cosmetic and the
+  # alternative — a static name — is less useful on the runs that actually deploy.
   deploy:
     name: deploy (${{ inputs.target }})
     needs: plan
