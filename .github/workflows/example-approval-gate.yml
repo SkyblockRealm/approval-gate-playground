@@ -206,6 +206,12 @@ jobs:
 
       # GitHub does not pass the approver's name to the job, so read it back from
       # the API. This is the audit line: who let this through, and when.
+      #
+      # The response is a top-level array of approvals (`user`, `state`,
+      # `comment`, `environments[]`), not the `{environments: […]}` envelope the
+      # older docs describe — the first run of this example failed on exactly
+      # that difference. And because a lookup failure must never fail a deploy
+      # that has already happened, the step is best-effort and always exits 0.
       - name: Who approved this
         id: approval
         env:
@@ -214,17 +220,16 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set -eu
-          set +e
-          body=$(gh api "repos/$REPO/actions/runs/$RUN_ID/approvals" 2>/dev/null)
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ] || [ -z "$body" ]; then
-            echo "note=approvals API unreadable; the run history still records it"
-            echo "approved_by=(unknown)" >> "$GITHUB_OUTPUT"
-            exit 0
+          approved=''
+          if body=$(gh api "repos/$REPO/actions/runs/$RUN_ID/approvals" 2>/dev/null); then
+            approved=$(printf '%s' "$body" | jq -r '
+              [ (if type == "array" then .[] else .environments[]? end)
+                | select((.state // "approved") == "approved")
+                | (.user.login? // (.approvers[]?.user.login?)) ]
+              | map(select(. != null)) | unique | join(", ")' 2>/dev/null || true)
+          else
+            echo "note: approvals API unreadable; the run history still records it"
           fi
-          approved=$(printf '%s' "$body" | jq -r '
-            [.environments[]?.approvers[]? | .user.login] | unique | join(", ")')
           echo "approved_by=${approved:-none recorded}" >> "$GITHUB_OUTPUT"
           echo "approved by: ${approved:-none recorded}"
 
