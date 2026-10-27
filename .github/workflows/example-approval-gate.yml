@@ -1,0 +1,249 @@
+# Example: a deployment with a human approval gate — nothing here touches a real
+# server. It exists to test the environment protection rule before we rely on it
+# (ADR-117: "an environment with required reviewers is the two pairs of eyes on
+# production control").
+#
+# Shape, and why it is this shape:
+#
+#   plan    runs immediately, no gate. It resolves what would be deployed and
+#           refuses a malformed request, so the thing you approve is a plan that
+#           already passed validation.
+#   deploy  names `environment: production`, so GitHub holds it until the
+#           environment's protection rules are satisfied. The approval happens
+#           *before the job starts*, so its `timeout-minutes` does not expire
+#           while you sleep — but the run sits queued and holds the concurrency
+#           lock, which is the cost of a gate nobody answers.
+#
+# The trap this file is mostly about: naming an environment that has no
+# protection rules configured deletes the gate silently. `environment:
+# production` on a repository whose `production` environment has no required
+# reviewers deploys immediately and reports success, exactly like the gated case.
+# Set the rule up first, then test it:
+#
+#   # one-time, per repository (environments do not cross repositories)
+#   gh api -X PUT "repos/$GITHUB_REPOSITORY/environments/production" \
+#     -f 'prevent_self_review=true' \
+#     -F "reviewers[][type]=User" \
+#     -F "reviewers[][id]=$(gh api users/<their-login> --jq .id)"
+#
+#   # what is actually configured — run this before blaming the workflow
+#   gh api "repos/$GITHUB_REPOSITORY/environments/production" \
+#     --jq '{name, rules: .protection_rules}'
+#
+# Or by hand: Settings → Environments → New environment → `production` →
+# Required reviewers (and tick "Prevent self-review").
+#
+# Plan availability, checked 2026-10-28 — this is the blocker, not a footnote:
+# GitHub Free can only configure environments on *public* repositories.
+# SkyblockRealm is on Free (`gh api orgs/SkyblockRealm --jq .plan.name` → "free")
+# and every repository is private, so `production` exists on neither `workspace`
+# nor `network` (`gh api repos/SkyblockRealm/network/environments` → empty).
+# That means the two deploy workflows that already say `environment: production`
+# have never been gated: naming an environment without rules is a no-op, which is
+# the trap above happening for real.
+#
+# So this file cannot be tested where it sits. It is exercised verbatim in
+# SkyblockRealm/approval-gate-playground, a public repository whose only purpose
+# is that one test (public + Free is enough for required reviewers). Keep the two
+# copies identical: this one is the reference, the sandbox is the proof.
+#
+# The remaining decision is how the *real* gate gets its plan: GitHub Team on the
+# org makes environments work on private repositories and makes ADR-117's gate
+# real for `repos/network/.github/workflows/deploy.yml`; a homegrown gate (an
+# `/approve` issue comment or a second `workflow_dispatch`) works on Free but is
+# audit-by-convention and cannot prevent self-approval.
+
+name: example · approve then deploy
+
+# The run's display title. A queued run waiting for approval should say what it
+# is about to do, because that title is what the approver reads in the inbox.
+run-name: example deploy · ${{ inputs.target }} · ${{ inputs.artefact }}${{ inputs.dry_run && ' · dry run' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'what this example pretends to deploy'
+        required: true
+        type: choice
+        options: ['hub-01', 'spawn-01', 'islands-01', 'proxy']
+        default: 'islands-01'
+      artefact:
+        description: 'release tag, the shape plan resolves (skyblock-<12 hex>)'
+        required: true
+        type: string
+        default: 'skyblock-000000000000'
+      dry_run:
+        description: 'print the plan only; skip the gate and the deploy job'
+        required: false
+        type: boolean
+        default: false
+
+# Least privilege, plus what the audit step needs to read back the approvers.
+permissions:
+  contents: read
+  actions: read
+
+# One deploy per target at a time (ADR-114). A second dispatch queues rather than
+# interleaving, and a run awaiting approval is inside the lock.
+concurrency:
+  group: example-deploy-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan (${{ inputs.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      target: ${{ steps.resolve.outputs.target }}
+      artefact: ${{ steps.resolve.outputs.artefact }}
+      commit: ${{ steps.resolve.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # A dispatch from a branch runs that branch's copy of this file. Requiring
+      # the default branch means the code being approved is the code that was
+      # reviewed in a pull request. (Branch restrictions can also be set on the
+      # environment; this check works without repository settings.)
+      - name: Refuse a dispatch from a branch
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+        run: |
+          set -eu
+          if [ "$REF" != "refs/heads/$DEFAULT" ]; then
+            echo "::error::dispatch from $REF; deploys run from refs/heads/$DEFAULT only"
+            exit 1
+          fi
+
+      # Validation happens here, ungated, so an approver never sees a request that
+      # could not have run anyway. The real workflow resolves the tag to a digest
+      # here and refuses a mismatch (ADR-127/131); this example checks the shape.
+      - name: Resolve and validate
+        id: resolve
+        env:
+          TARGET: ${{ inputs.target }}
+          ARTEFACT: ${{ inputs.artefact }}
+        run: |
+          set -eu
+          printf '%s' "$ARTEFACT" | grep -Eq '^skyblock-[0-9a-f]{12}$' || {
+            echo "::error::artefact must look like skyblock-<12 hex>, got '$ARTEFACT'"
+            exit 1
+          }
+          case "$TARGET" in
+            hub-01|spawn-01|islands-01|proxy) ;;
+            *) echo "::error::unknown target '$TARGET'"; exit 1 ;;
+          esac
+          {
+            echo "target=$TARGET"
+            echo "artefact=$ARTEFACT"
+            echo "commit=$GITHUB_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write the plan
+        env:
+          TARGET: ${{ steps.resolve.outputs.target }}
+          ARTEFACT: ${{ steps.resolve.outputs.artefact }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: |
+          set -eu
+          {
+            echo "## Plan — $ARTEFACT → $TARGET"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| target | \`$TARGET\` |"
+            echo "| artefact | \`$ARTEFACT\` |"
+            echo "| commit | \`${GITHUB_SHA:0:12}\` |"
+            echo "| requested by | @$GITHUB_ACTOR |"
+            echo "| dry run | $([ "$DRY_RUN" = 1 ] && echo yes || echo no) |"
+            echo
+            echo "Mode 4 (in-place reload) would run: stage → announce → reload → health → record."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The gate. One job names the environment, so one approval per run — a second
+  # gated job in the same run may re-ask depending on the rules configured, and
+  # there is no reason to spend a second approval on the same decision.
+  deploy:
+    name: deploy (${{ inputs.target }})
+    needs: plan
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: production
+      url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    env:
+      TARGET: ${{ needs.plan.outputs.target }}
+      ARTEFACT: ${{ needs.plan.outputs.artefact }}
+      COMMIT: ${{ needs.plan.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # From here on, everything is fake. A real deploy calls scripts/deploy/*.sh
+      # (ADR-117) and this job must not grow the logic — if a step needs an `if`,
+      # the control plane cannot reuse the script and the two diverge.
+      - name: Plan being executed
+        run: |
+          set -eu
+          echo "target:   $TARGET"
+          echo "artefact: $ARTEFACT"
+          echo "commit:   $COMMIT"
+          echo "this is what was approved; nothing is resolved after the gate"
+
+      - name: Stage (pretend)
+        run: |
+          set -eu
+          echo "would copy $ARTEFACT into /srv/skyblock/$TARGET/versions/…"
+          sleep 2
+
+      - name: Health (pretend)
+        run: |
+          set -eu
+          echo "would wait for 'Done (' in the shard log, not a TCP connect (ADR-122)"
+          sleep 2
+
+      # GitHub does not pass the approver's name to the job, so read it back from
+      # the API. This is the audit line: who let this through, and when.
+      - name: Who approved this
+        id: approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -eu
+          set +e
+          body=$(gh api "repos/$REPO/actions/runs/$RUN_ID/approvals" 2>/dev/null)
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] || [ -z "$body" ]; then
+            echo "note=approvals API unreadable; the run history still records it"
+            echo "approved_by=(unknown)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          approved=$(printf '%s' "$body" | jq -r '
+            [.environments[]?.approvers[]? | .user.login] | unique | join(", ")')
+          echo "approved_by=${approved:-none recorded}" >> "$GITHUB_OUTPUT"
+          echo "approved by: ${approved:-none recorded}"
+
+      - name: Record
+        env:
+          APPROVED_BY: ${{ steps.approval.outputs.approved_by }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          set -eu
+          {
+            echo "## Deployed — $ARTEFACT → $TARGET"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| environment | \`production\` |"
+            echo "| approved by | $APPROVED_BY |"
+            echo "| requested by | @$GITHUB_ACTOR |"
+            echo "| commit deployed | \`${COMMIT:0:12}\` |"
+            echo "| run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+            echo
+            echo "This run is the audit row (ADR-117): inputs, approver, result."
+          } >> "$GITHUB_STEP_SUMMARY"
